@@ -11,7 +11,11 @@
 
   assign resolved_variant = nil
   if sp != blank
-    assign resolved_variant = sp.selected_or_first_available_variant
+    assign variant_idx = st.variant_position | times: 1 | minus: 1
+    assign resolved_variant = sp.variants[variant_idx]
+    if resolved_variant == blank
+      assign resolved_variant = sp.selected_or_first_available_variant
+    endif
   endif
 
   # ── M09: Sistema de preços ───────────────────────────────────────────────
@@ -40,11 +44,21 @@
     endif
   endif
 
+  # ── M09: Parcelamento — calculado integralmente pelo JS (PriceModule) ───────
+  assign resolved_price_cents = 0
+  if st.use_product_price and resolved_variant != blank
+    assign resolved_price_cents = price_cents
+  endif
+
   # ── M08: Resolução de imagem ─────────────────────────────────────────────
   assign resolved_img_url = ''
   assign resolved_img_alt = resolved_name
-  if st.use_product_image and sp != blank and sp.featured_image != blank
-    assign resolved_img_url = sp.featured_image | image_url: width: 500
+  if st.use_product_image and sp != blank
+    if resolved_variant != blank and resolved_variant.featured_image != blank
+      assign resolved_img_url = resolved_variant.featured_image | image_url: width: 500
+    elsif sp.featured_image != blank
+      assign resolved_img_url = sp.featured_image | image_url: width: 500
+    endif
   elsif st.custom_product_image != blank
     assign resolved_img_url = st.custom_product_image | image_url: width: 500
   endif
@@ -614,12 +628,8 @@
             <span
               class="promo-banner__badge promo-banner__badge--discount"
               data-banner-discount-badge
-              {% if use_liquid_discount %}
-                style="display:inline-block"
-              {% endif %}
-            >
-              {% if use_liquid_discount %}{{ discount_pct_liquid }}% OFF{% endif %}
-            </span>
+              style="display:none"
+            ></span>
           {% endif %}
         </div>
 
@@ -634,11 +644,7 @@
           {% endif %}
         </div>
 
-        {% if st.installments_text != blank %}
-          <span class="promo-banner__installments" data-banner-installments>
-            {{ st.installments_text }}
-          </span>
-        {% endif %}
+        <span class="promo-banner__installments" data-banner-installments style="display:none"></span>
 
         {% comment %}── M10: Frete grátis ──{% endcomment %}
         {% if st.show_shipping_badge %}
@@ -794,7 +800,10 @@
     bgMid:               {{ st.background_color_mid | json }},
     bgEnd:               {{ st.background_color_end | json }},
     enableShine:         {{ st.enable_shine | json }},
-    shineDuration:       {{ st.shine_duration | json }}
+    shineDuration:       {{ st.shine_duration | json }},
+    priceCents:          {{ resolved_price_cents | json }},
+    installmentsCount:   {{ st.installments_count | json }},
+    installmentsRate:    {{ st.installments_rate | json }}
   };
 
   /* ═══ CHECKPOINT [M17] Scoping e isolamento ✓ — CONFIG + sectionRoot inicializados ═══ */
@@ -871,24 +880,43 @@
   var oldNum = parsePrice(CONFIG.oldPrice);
   var newNum = parsePrice(CONFIG.newPrice);
 
-  // Desconto: Liquid já calculou para modo produto; JS calcula para custom prices
+  // ── Badge de desconto — calculado em JS para ambos os modos ──────────────
   if (CONFIG.showDiscountBadge && elDiscountBadge) {
-    if (CONFIG.discountPct !== null) {
-      // Liquid calculation (product price mode)
-      elDiscountBadge.textContent = CONFIG.discountPct + '% OFF';
-      elDiscountBadge.style.display = 'inline-block';
-    } else if (!isNaN(oldNum) && !isNaN(newNum) && oldNum > 0 && newNum < oldNum) {
-      // JS calculation (custom price mode — original logic)
-      var pct = Math.round(((oldNum - newNum) / oldNum) * 100);
-      elDiscountBadge.textContent = pct + '% OFF';
-      elDiscountBadge.style.display = 'inline-block';
+    var discOld = CONFIG.priceCents > 0 ? (parsePrice(CONFIG.oldPrice) || 0) : oldNum;
+    var discNew = CONFIG.priceCents > 0 ? CONFIG.priceCents / 100            : newNum;
+    if (!isNaN(discOld) && !isNaN(discNew) && discOld > 0 && discNew < discOld) {
+      var pct = Math.round(((discOld - discNew) / discOld) * 100);
+      elDiscountBadge.textContent    = pct + '% OFF';
+      elDiscountBadge.style.display  = 'inline-block';
     }
   }
 
-  // Frete grátis — JS handles custom price mode; Liquid pre-handles product mode
+  // ── Frete grátis ──────────────────────────────────────────────────────────
   if (elShipping && !CONFIG.showShippingInitial) {
     if (!isNaN(newNum) && newNum > CONFIG.freeShippingMin) {
       elShipping.classList.add('is-visible');
+    }
+  }
+
+  // ── Parcelamento automático — fórmula Price × [r(1+r)^n / ((1+r)^n − 1)] ─
+  if (elInstallments) {
+    var instPrice = CONFIG.priceCents > 0 ? CONFIG.priceCents / 100 : newNum;
+    var n = CONFIG.installmentsCount;
+    var r = CONFIG.installmentsRate / 100;
+    if (!isNaN(instPrice) && instPrice > 0 && n >= 1) {
+      var instValue;
+      if (r === 0) {
+        instValue = instPrice / n;
+      } else {
+        var _pow = Math.pow(1 + r, n);
+        instValue = instPrice * (r * _pow) / (_pow - 1);
+      }
+      instValue = Math.floor(instValue * 100) / 100;
+      var instStr = instValue.toFixed(2).replace('.', ',');
+      elInstallments.textContent   = n === 1
+        ? 'à vista R$ ' + instStr
+        : 'ou até ' + n + 'x de R$ ' + instStr + (r === 0 ? ' sem juros' : '');
+      elInstallments.style.display = 'inline';
     }
   }
 
@@ -1004,11 +1032,13 @@
       var mode = CONFIG.ctaMode;
 
       if (mode === 'drawer') {
-        // Adicionar ao carrinho e abrir drawer do tema Denavita
+        // Carrinho customizado Denavita (VZ — vendedor-denavita-x.liquid)
+        // Nota: VZ.adicionarAoCarrinho() tem bug interno (passa resposta de /cart/add.js
+        // para processarCarrinho que espera /cart.js), então fazemos o fetch manualmente
+        // e chamamos VZ.abrirCarrinho() diretamente — que já chama renderCarrinho() internamente.
         var variantId = CONFIG.variantId;
         if (!variantId) {
-          var cartEl = document.querySelector('cart-notification') || document.querySelector('cart-drawer');
-          if (cartEl && typeof cartEl.open === 'function') { cartEl.open(); }
+          if (typeof VZ !== 'undefined') { VZ.abrirCarrinho(); }
           return;
         }
         fetch('/cart/add.js', {
@@ -1017,11 +1047,12 @@
           body: JSON.stringify({ id: variantId, quantity: 1 })
         })
           .then(function () {
-            var cartEl = document.querySelector('cart-notification') || document.querySelector('cart-drawer');
-            if (cartEl && typeof cartEl.open === 'function') {
-              cartEl.open();
+            if (typeof VZ !== 'undefined' && typeof VZ.abrirCarrinho === 'function') {
+              VZ.abrirCarrinho();
             } else {
-              window.location.href = '/cart';
+              var cartEl = document.querySelector('cart-notification') || document.querySelector('cart-drawer');
+              if (cartEl && typeof cartEl.open === 'function') { cartEl.open(); }
+              else { window.location.href = '/cart'; }
             }
           })
           .catch(function () { window.location.href = '/cart'; });
@@ -1120,6 +1151,13 @@
   "settings": [
     { "type": "header",  "content": "Produto" },
     { "type": "product", "id": "selected_product",    "label": "Produto da oferta" },
+    { "type": "select",  "id": "variant_position",    "label": "Variante do produto",          "default": "1",
+      "options": [
+        { "value": "1", "label": "Variante 1" },
+        { "value": "2", "label": "Variante 2" },
+        { "value": "3", "label": "Variante 3" }
+      ]
+    },
     { "type": "header",  "content": "Conteúdo" },
     { "type": "checkbox","id": "use_product_title",   "label": "Usar título do produto",       "default": true },
     { "type": "text",    "id": "custom_product_name", "label": "Nome (override)",              "default": "TONS" },
@@ -1131,7 +1169,11 @@
     { "type": "checkbox","id": "use_product_price",   "label": "Usar preço do produto",        "default": false },
     { "type": "text",    "id": "custom_old_price",    "label": "Preço antigo (override)",      "default": "R$ 492,50" },
     { "type": "text",    "id": "custom_new_price",    "label": "Preço novo (override)",        "default": "R$ 298,00" },
-    { "type": "text",    "id": "installments_text",   "label": "Texto de parcelamento",        "default": "ou até 10x de R$ 34,92" },
+    { "type": "range",     "id": "installments_count", "label": "Número de parcelas",
+      "min": 1, "max": 12, "step": 1, "default": 10 },
+    { "type": "paragraph", "content": "💡 Taxa 0% = sem juros (divisão simples do valor)" },
+    { "type": "range",     "id": "installments_rate",  "label": "Taxa de juros",
+      "min": 0, "max": 10, "step": 1, "default": 3, "unit": "%am" },
     { "type": "checkbox","id": "use_compare_at_for_discount","label": "Calcular desconto via compare_at_price","default": true },
     { "type": "text",    "id": "fallback_compare_price","label":"Preço de comparação (fallback)","default": "R$ 492,50" },
     { "type": "header",  "content": "Badges e Frete" },
